@@ -1,8 +1,60 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { PDFDocument, StandardFonts, rgb, degrees } from 'pdf-lib'
 import { supabaseAdmin, createServerSupabaseClient } from '../../../_supabaseAdmin'
 
 // Force dynamic to avoid build-time initialization issues
 export const dynamic = 'force-dynamic'
+export const runtime = 'nodejs'
+
+function fitTextToPageWidth(text: string, font: { widthOfTextAtSize: (t: string, s: number) => number }, fontSize: number, maxWidth: number): string {
+  let fitted = text.trim()
+  if (!fitted) return 'Bidding Company'
+  while (fitted.length > 0 && font.widthOfTextAtSize(fitted, fontSize) > maxWidth) {
+    fitted = fitted.slice(0, -1)
+  }
+  if (fitted.length < text.trim().length && fitted.length > 3) {
+    fitted = `${fitted.slice(0, -3)}...`
+  }
+  return fitted || 'Bidding Company'
+}
+
+// Stamp every page with the bidding company name as the only watermark.
+async function watermarkPdf(input: Buffer, biddingCompanyName: string): Promise<Buffer> {
+  const pdf = await PDFDocument.load(input, { ignoreEncryption: true })
+  const bold = await pdf.embedFont(StandardFonts.HelveticaBold)
+  const companyRaw =
+    biddingCompanyName.replace(/[^\x20-\x7E]/g, ' ').replace(/\s+/g, ' ').trim() || 'Bidding Company'
+
+  for (const page of pdf.getPages()) {
+    const { width, height } = page.getSize()
+    const pageMin = Math.min(width, height)
+    const maxTextWidth = pageMin * 0.72
+    const maxFontSize = pageMin * 0.11
+    const minFontSize = 10
+
+    let companyLine = companyRaw
+    let fontSize = maxFontSize
+    while (fontSize > minFontSize && bold.widthOfTextAtSize(companyLine, fontSize) > maxTextWidth) {
+      fontSize -= 0.5
+    }
+    if (bold.widthOfTextAtSize(companyLine, fontSize) > maxTextWidth) {
+      companyLine = fitTextToPageWidth(companyLine, bold, fontSize, maxTextWidth)
+    }
+
+    const textWidth = bold.widthOfTextAtSize(companyLine, fontSize)
+    page.drawText(companyLine, {
+      x: width / 2 - (textWidth / 2) * Math.cos(Math.PI / 4),
+      y: height / 2 - (textWidth / 2) * Math.sin(Math.PI / 4),
+      size: fontSize,
+      font: bold,
+      color: rgb(0.55, 0.55, 0.55),
+      opacity: 0.18,
+      rotate: degrees(45),
+    })
+  }
+
+  return Buffer.from(await pdf.save())
+}
 
 async function getUserAndToken(request: NextRequest) {
   const authHeader = request.headers.get('authorization')
@@ -75,16 +127,14 @@ export async function POST(
       }, { status: 400 })
     }
 
-    // Validate file type
-    const allowedTypes = [
-      'application/pdf',
-      'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    ]
-    
-    if (!allowedTypes.includes(file.type)) {
+    // Validate file type - PDF only (with extension fallback for browsers that send octet-stream)
+    const isPdf = file.type === 'application/pdf'
+      || ((file.type === 'application/octet-stream' || file.type === '')
+          && file.name.toLowerCase().endsWith('.pdf'))
+
+    if (!isPdf) {
       return NextResponse.json({ 
-        error: 'Only PDF and Word documents are allowed' 
+        error: 'Only PDF documents are allowed' 
       }, { status: 400 })
     }
 
@@ -109,6 +159,21 @@ export async function POST(
 
       companyName = (profile as any)?.company_name || 'Company'
     }
+
+    // Use JV partner name on watermark when uploading a consortium company document
+    let watermarkCompanyName = companyName
+    if (consortiumCompanyId) {
+      const { data: consortiumRow } = await supabaseUser
+        .from('bid_consortium_companies')
+        .select('company_name')
+        .eq('id', consortiumCompanyId)
+        .eq('bid_application_id', id)
+        .maybeSingle()
+
+      if ((consortiumRow as { company_name?: string } | null)?.company_name) {
+        watermarkCompanyName = (consortiumRow as { company_name: string }).company_name
+      }
+    }
     
     // Sanitize company name for folder name (remove special chars, limit length)
     const sanitizedCompanyName = companyName
@@ -129,13 +194,26 @@ export async function POST(
     const arrayBuffer = await file.arrayBuffer()
     const buffer = Buffer.from(arrayBuffer)
 
+    // Watermark before upload so only the watermarked copy is ever stored.
+    // Reject on failure to keep the "all stored PDFs are watermarked" guarantee.
+    let uploadBuffer: Buffer
+    try {
+      uploadBuffer = await watermarkPdf(buffer, watermarkCompanyName)
+    } catch (e) {
+      console.error('Watermarking failed:', e)
+      return NextResponse.json(
+        { error: 'Could not process this PDF. Please upload a valid, unprotected PDF.' },
+        { status: 400 }
+      )
+    }
+
     // Upload to Supabase Storage
     const { error: uploadError } = await supabaseUser.storage
       .from('bid-submissions')
-      .upload(filePath, buffer, {
+      .upload(filePath, uploadBuffer, {
         cacheControl: '3600',
         upsert: true,
-        contentType: file.type
+        contentType: 'application/pdf'
       })
 
     if (uploadError) {
@@ -187,8 +265,8 @@ export async function POST(
         consortium_company_id: consortiumCompanyId || null,
         file_url: urlData.publicUrl,
         file_name: trunc(file.name),
-        file_size: file.size,
-        file_type: trunc(file.type)
+        file_size: uploadBuffer.length,
+        file_type: 'application/pdf'
       })
       .select()
       .single()

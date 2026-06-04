@@ -503,7 +503,7 @@ export default function BidSubmissionPage({
       const { data: area, error: areaError } = await supabase
         .from('areas')
         .select(`
-          id, name, code, status, bid_submission_deadline, price,
+          id, name, code, status, bid_submission_deadline, price, grid_area,
           zones!inner(
             name,
             blocks!inner(name, type)
@@ -642,7 +642,10 @@ export default function BidSubmissionPage({
       }
 
       // Load work unit if exists (note: work_units is null when encrypted, use work_units_encrypted_at to check)
-      if (app.work_units) {
+      // Stored value is the TOTAL (100 + offered * grid_area), so reverse-derive the offered value to prefill the input
+      if (app.work_units && Number(area?.grid_area)) {
+        setWorkUnit(((app.work_units - 100) / Number(area.grid_area)).toString())
+      } else if (app.work_units) {
         setWorkUnit(app.work_units.toString())
       } else if (app.work_units_encrypted_at) {
         // Work units are encrypted - set placeholder value to indicate they were saved
@@ -1392,6 +1395,11 @@ export default function BidSubmissionPage({
 
   const docProgress = getDocumentProgress()
 
+  // Work Units = 100 + (offered x grid_area). User enters the offered value; we compute + save the total.
+  const gridArea = Number(areaDetails?.grid_area) || 0
+  const offeredNum = workUnit === '' ? NaN : Number(workUnit)
+  const totalWorkUnits = !isNaN(offeredNum) ? 100 + offeredNum * gridArea : 0
+
   const deadlineText = application?.deadline 
     ? `Deadline: ${new Date(application.deadline).toLocaleDateString('en-US', {
         year: 'numeric',
@@ -1636,7 +1644,7 @@ export default function BidSubmissionPage({
             <CardHeader>
               <CardTitle className="flex items-center space-x-2">
                 <CreditCard className="w-5 h-5 text-teal-600" />
-                <span>Step 2: Application Fee Payment</span>
+                <span>Step 2: Application Fee Payment (Annexure E)</span>
               </CardTitle>
               <CardDescription>
                 Pay the application fee of Rs. 100,000 PKR
@@ -1980,7 +1988,7 @@ export default function BidSubmissionPage({
                 <span>Step 3: Work Unit</span>
               </CardTitle>
               <CardDescription>
-                Enter your work unit value
+                Enter your work units offered. The total work units are calculated automatically.
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
@@ -1998,9 +2006,32 @@ export default function BidSubmissionPage({
 
               {/* Work Unit - At the top */}
               <div>
+                {/* Formula + live total */}
+                <div className="mb-4 rounded-lg border border-teal-100 bg-teal-50 p-4">
+                  <p className="text-xs font-medium text-teal-800">
+                    Total Work Units = 100 + (Work Units Offered × Grid Area)
+                  </p>
+                  <div className="mt-2 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-sm text-gray-700">
+                    <span>Grid Area:</span>
+                    <span className="font-semibold text-gray-900">{gridArea}</span>
+                  </div>
+                  <div className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-sm text-gray-700">
+                    <span className="font-mono">
+                      100 + ({workUnit && !isNaN(offeredNum) ? offeredNum : 0} × {gridArea}) =
+                    </span>
+                    <span className="text-lg font-bold text-teal-700">
+                      {workUnit && !isNaN(offeredNum) ? totalWorkUnits : 0}
+                    </span>
+                    <span className="text-xs text-gray-500">total work units</span>
+                  </div>
+                  <p className="mt-2 text-xs text-gray-500">
+                    This total is the value saved to your application.
+                  </p>
+                </div>
+
                 <div className="flex items-center justify-between mb-2">
                   <label htmlFor="workUnit" className="block text-sm font-medium text-gray-700">
-                    Total Work Unit <span className="text-red-500">*</span>
+                    Work Units Offered <span className="text-red-500">*</span>
                   </label>
                   {application?.work_units_encrypted_at && (
                     <span className="text-xs text-green-600 flex items-center gap-1">
@@ -2022,7 +2053,7 @@ export default function BidSubmissionPage({
                       setWorkUnit(value)
                       // Validate: must be 100 or above
                       if (value !== '' && (!isNaN(Number(value)) && Number(value) < 100)) {
-                        setWorkUnitError('Work unit must be 100 or above')
+                        setWorkUnitError('Work units offered must be 100 or above')
                       } else {
                         setWorkUnitError('')
                       }
@@ -2068,7 +2099,7 @@ export default function BidSubmissionPage({
                     {consortiumCompanies.map((company, index) => {
                       const companyKey = `company_${index}`
                       const percentage = consortiumPercentages[companyKey] || ''
-                      const calculatedUnits = workUnit && percentage ? ((Number(workUnit) * Number(percentage)) / 100).toFixed(2) : '0.00'
+                      const calculatedUnits = totalWorkUnits && percentage ? ((totalWorkUnits * Number(percentage)) / 100).toFixed(2) : '0.00'
                       
                       return (
                         <div key={index} className="grid grid-cols-12 gap-3 items-start">
@@ -2198,17 +2229,20 @@ export default function BidSubmissionPage({
                 <Button 
                   onClick={async () => {
                     if (!workUnit || workUnit.trim() === '') {
-                      setWorkUnitError('Work unit is required')
-                      setError('Work unit is required')
+                      setWorkUnitError('Work units offered is required')
+                      setError('Work units offered is required')
                       return
                     }
                     
                     const workUnitNum = Number(workUnit)
                     if (isNaN(workUnitNum) || workUnitNum < 101) {
-                      setWorkUnitError('Work unit must be 101 or above')
-                      setError('Work unit must be 101 or above')
+                      setWorkUnitError('Work units offered must be 101 or above')
+                      setError('Work units offered must be 101 or above')
                       return
                     }
+
+                    // Total = 100 + (offered x grid_area). This computed total is what gets saved.
+                    const totalToSave = 100 + workUnitNum * gridArea
 
                     // Validate consortium companies and percentages if consortium submission
                     if (application?.submission_type === 'consortium') {
@@ -2280,7 +2314,7 @@ export default function BidSubmissionPage({
                            'Authorization': `Bearer ${token}`
                          },
                          body: JSON.stringify({
-                           work_units: workUnitNum,
+                           work_units: totalToSave,
                            consortium_companies: application.submission_type === 'consortium' ? validCompanies : undefined,
                            consortium_percentages: application.submission_type === 'consortium' ? consortiumPercentages : undefined
                          })
@@ -2477,7 +2511,7 @@ export default function BidSubmissionPage({
                                                <label className="cursor-pointer">
                                                  <input
                                                    type="file"
-                                                   accept=".pdf,.doc,.docx"
+                                                   accept=".pdf,application/pdf"
                                                    multiple
                                                    className="hidden"
                                                    onChange={async (e) => {
@@ -2610,7 +2644,7 @@ export default function BidSubmissionPage({
                                            <label className="cursor-pointer">
                                              <input
                                                type="file"
-                                               accept=".pdf,.doc,.docx"
+                                               accept=".pdf,application/pdf"
                                                className="hidden"
                                                onChange={(e) => {
                                                  const file = e.target.files?.[0]
@@ -2701,7 +2735,7 @@ export default function BidSubmissionPage({
                                      <label className="cursor-pointer">
                                        <input
                                          type="file"
-                                         accept=".pdf,.doc,.docx"
+                                         accept=".pdf,application/pdf"
                                          multiple
                                          className="hidden"
                                          onChange={async (e) => {
@@ -2847,7 +2881,7 @@ export default function BidSubmissionPage({
                                  <label className="cursor-pointer">
                                    <input
                                      type="file"
-                                     accept=".pdf,.doc,.docx"
+                                     accept=".pdf,application/pdf"
                                      className="hidden"
                                      onChange={(e) => {
                                        const file = e.target.files?.[0]
@@ -2895,7 +2929,7 @@ export default function BidSubmissionPage({
                    <ul className="space-y-1 text-blue-700">
                      <li className="flex items-center gap-2">
                        <span className="w-1.5 h-1.5 bg-blue-500 rounded-full"></span>
-                       Accepted formats: PDF, DOC, DOCX
+                       Accepted format: PDF only
                      </li>
                      <li className="flex items-center gap-2">
                        <span className="w-1.5 h-1.5 bg-blue-500 rounded-full"></span>
